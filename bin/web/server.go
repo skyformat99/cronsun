@@ -18,7 +18,9 @@ import (
 )
 
 var (
-	level = flag.Int("l", 0, "log level, -1:debug, 0:info, 1:warn, 2:error")
+	level    = flag.Int("l", 0, "log level, -1:debug, 0:info, 1:warn, 2:error")
+	confFile = flag.String("conf", "conf/files/base.json", "config file path")
+	network  = flag.String("network", "", "network protocol of listen address: ipv4/ipv6, or empty use both")
 )
 
 func main() {
@@ -33,12 +35,13 @@ func main() {
 	}
 	log.SetLogger(logger.Sugar())
 
-	if err := cronsun.Init(); err != nil {
+	if err = cronsun.Init(*confFile, true); err != nil {
 		log.Errorf(err.Error())
 		return
 	}
+	web.EnsureJobLogIndex()
 
-	l, err := net.Listen("tcp", conf.Config.Web.BindAddr)
+	l, err := net.Listen(checkNetworkProtocol(*network), conf.Config.Web.BindAddr)
 	if err != nil {
 		log.Errorf(err.Error())
 		return
@@ -59,7 +62,7 @@ func main() {
 		if len(conf.Config.Mail.HttpAPI) > 0 {
 			noticer = &cronsun.HttpAPI{}
 		} else {
-			mailer, err := cronsun.NewMail(10 * time.Second)
+			mailer, err := cronsun.NewMail(30 * time.Second)
 			if err != nil {
 				log.Errorf(err.Error())
 				return
@@ -67,6 +70,15 @@ func main() {
 			noticer = mailer
 		}
 		go cronsun.StartNoticer(noticer)
+	}
+
+	period := int64(conf.Config.Web.LogCleaner.EveryMinute)
+	var stopCleaner func(interface{})
+	if period > 0 {
+		closeChan := web.RunLogCleaner(time.Duration(period)*time.Minute, time.Duration(conf.Config.Web.LogCleaner.ExpirationDays)*time.Hour*24)
+		stopCleaner = func(i interface{}) {
+			close(closeChan)
+		}
 	}
 
 	go func() {
@@ -80,9 +92,20 @@ func main() {
 
 	log.Infof("cronsun web server started on %s, Ctrl+C or send kill sign to exit", conf.Config.Web.BindAddr)
 	// 注册退出事件
-	event.On(event.EXIT, conf.Exit)
+	event.On(event.EXIT, conf.Exit, stopCleaner)
 	// 监听退出信号
 	event.Wait()
 	event.Emit(event.EXIT, nil)
 	log.Infof("exit success")
+}
+
+func checkNetworkProtocol(p string) string {
+	switch p {
+	case "ipv4":
+		return "tcp4"
+	case "ipv6":
+		return "tcp6"
+	}
+
+	return "tcp"
 }

@@ -17,7 +17,8 @@ import (
 )
 
 var (
-	level = flag.Int("l", 0, "log level, -1:debug, 0:info, 1:warn, 2:error")
+	level    = flag.Int("l", 0, "log level, -1:debug, 0:info, 1:warn, 2:error")
+	confFile = flag.String("conf", "conf/files/base.json", "config file path")
 )
 
 func main() {
@@ -26,13 +27,14 @@ func main() {
 	lcf := zap.NewDevelopmentConfig()
 	lcf.Level.SetLevel(zapcore.Level(*level))
 	lcf.Development = false
+	lcf.DisableStacktrace = true
 	logger, err := lcf.Build(zap.AddCallerSkip(1))
 	if err != nil {
 		slog.Fatalln("new log err:", err.Error())
 	}
 	log.SetLogger(logger.Sugar())
 
-	if err := cronsun.Init(); err != nil {
+	if err = cronsun.Init(*confFile, true); err != nil {
 		log.Errorf(err.Error())
 		return
 	}

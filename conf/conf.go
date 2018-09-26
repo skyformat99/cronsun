@@ -1,13 +1,18 @@
 package conf
 
 import (
-	"flag"
+	"errors"
+	"fmt"
+	"io/ioutil"
+	"os"
 	"path"
+	"strings"
 	"time"
 
 	client "github.com/coreos/etcd/clientv3"
 	"github.com/fsnotify/fsnotify"
 	"github.com/go-gomail/gomail"
+	"github.com/gofrs/uuid"
 
 	"github.com/shunfei/cronsun/db"
 	"github.com/shunfei/cronsun/event"
@@ -16,9 +21,6 @@ import (
 )
 
 var (
-	confFile = flag.String("conf",
-		"conf/files/base.json", "config file path")
-
 	Config      = new(Conf)
 	initialized bool
 
@@ -26,18 +28,21 @@ var (
 	exitChan = make(chan struct{})
 )
 
-func Init() error {
+func Init(confFile string, watchConfiFile bool) error {
 	if initialized {
 		return nil
 	}
 
-	flag.Parse()
-	if err := Config.parse(); err != nil {
+	if err := Config.parse(confFile); err != nil {
 		return err
 	}
-	if err := Config.watch(); err != nil {
-		return err
+
+	if watchConfiFile {
+		if err := Config.watch(confFile); err != nil {
+			return err
+		}
 	}
+
 	initialized = true
 	return nil
 }
@@ -47,9 +52,13 @@ type Conf struct {
 	Proc    string // 当前执行任务路径
 	Cmd     string // cmd 路径
 	Once    string // 马上执行任务路径
+	Csctl   string // csctl 发送执行命令的路径
 	Lock    string // job lock 路径
 	Group   string // 节点分组
 	Noticer string // 通知
+
+	PIDFile  string
+	UUIDFile string
 
 	Ttl        int64 // 节点超时时间，单位秒
 	ReqTimeout int   // 请求超时时间，单位秒
@@ -63,7 +72,7 @@ type Conf struct {
 	// 默认 300
 	LockTtl int64
 
-	Etcd client.Config
+	Etcd *etcdConfig
 	Mgo  *db.Config
 	Web  *webConfig
 	Mail *MailConf
@@ -71,12 +80,29 @@ type Conf struct {
 	Security *Security
 }
 
+type etcdConfig struct {
+	Endpoints   []string
+	Username    string
+	Password    string
+	DialTimeout int64 // 单位秒
+
+	conf client.Config
+}
+
+func (e *etcdConfig) Copy() client.Config {
+	return e.conf
+}
+
 type webConfig struct {
 	BindAddr string
 	Auth     struct {
 		Enabled bool
 	}
-	Session SessionConfig
+	Session    SessionConfig
+	LogCleaner struct {
+		EveryMinute    int
+		ExpirationDays int
+	}
 }
 
 type SessionConfig struct {
@@ -120,15 +146,63 @@ func cleanKeyPrefix(p string) string {
 	return p
 }
 
-func (c *Conf) parse() error {
-	err := utils.LoadExtendConf(*confFile, c)
+var errUUIDFilePathRequired = errors.New("the UUIDFile file path is required, see base.json.sample")
+
+func (c *Conf) UUID() (string, error) {
+	c.UUIDFile = strings.TrimSpace(c.UUIDFile)
+	if len(c.UUIDFile) == 0 {
+		return "", errUUIDFilePathRequired
+	}
+	c.UUIDFile = path.Clean(c.UUIDFile)
+
+	b, err := ioutil.ReadFile(c.UUIDFile)
+	if err == nil {
+		if len(b) == 0 {
+			return c.genUUID()
+		}
+		suid := strings.Join(strings.Fields(string(b)), "")
+		return suid, nil
+	}
+
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	return c.genUUID()
+}
+
+func (c *Conf) genUUID() (string, error) {
+	u, err := uuid.NewV4()
+	if err != nil {
+		return "", err
+	}
+
+	uuidDir := path.Dir(c.UUIDFile)
+	if err := os.MkdirAll(uuidDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to write UUID to file: %s. you can change UUIDFile config in base.json", err)
+	}
+
+	err = ioutil.WriteFile(c.UUIDFile, []byte(u.String()), 0600)
+	if err != nil {
+		return "", fmt.Errorf("failed to write UUID to file: %s. you can change UUIDFile config in base.json", err)
+	}
+
+	return u.String(), nil
+}
+
+func (c *Conf) parse(confFile string) error {
+	err := utils.LoadExtendConf(confFile, c)
 	if err != nil {
 		return err
 	}
 
 	if c.Etcd.DialTimeout > 0 {
-		c.Etcd.DialTimeout *= time.Second
+		c.Etcd.conf.DialTimeout = time.Duration(c.Etcd.DialTimeout) * time.Second
 	}
+	c.Etcd.conf.Username = c.Etcd.Username
+	c.Etcd.conf.Password = c.Etcd.Password
+	c.Etcd.conf.Endpoints = c.Etcd.Endpoints
+
 	if c.Ttl <= 0 {
 		c.Ttl = 10
 	}
@@ -144,10 +218,20 @@ func (c *Conf) parse() error {
 		c.Mgo.Timeout *= time.Second
 	}
 
+	if c.Web != nil {
+		if c.Web.LogCleaner.EveryMinute < 0 {
+			c.Web.LogCleaner.EveryMinute = 30
+		}
+		if c.Web.LogCleaner.ExpirationDays <= 0 {
+			c.Web.LogCleaner.ExpirationDays = 1
+		}
+	}
+
 	c.Node = cleanKeyPrefix(c.Node)
 	c.Proc = cleanKeyPrefix(c.Proc)
 	c.Cmd = cleanKeyPrefix(c.Cmd)
 	c.Once = cleanKeyPrefix(c.Once)
+	c.Csctl = cleanKeyPrefix(c.Csctl)
 	c.Lock = cleanKeyPrefix(c.Lock)
 	c.Group = cleanKeyPrefix(c.Group)
 	c.Noticer = cleanKeyPrefix(c.Noticer)
@@ -155,7 +239,7 @@ func (c *Conf) parse() error {
 	return nil
 }
 
-func (c *Conf) watch() error {
+func (c *Conf) watch(confFile string) error {
 	var err error
 	watcher, err = fsnotify.NewWatcher()
 	if err != nil {
@@ -177,7 +261,7 @@ func (c *Conf) watch() error {
 				timer.Reset(duration)
 			case <-timer.C:
 				if update {
-					c.reload()
+					c.reload(confFile)
 					event.Emit(event.WAIT, nil)
 					update = false
 				}
@@ -188,7 +272,7 @@ func (c *Conf) watch() error {
 		}
 	}()
 
-	return watcher.Add(*confFile)
+	return watcher.Add(confFile)
 }
 
 // 重新加载配置项
@@ -196,18 +280,18 @@ func (c *Conf) watch() error {
 // Etcd
 // Mgo
 // Web
-func (c *Conf) reload() {
+func (c *Conf) reload(confFile string) {
 	cf := new(Conf)
-	if err := cf.parse(); err != nil {
+	if err := cf.parse(confFile); err != nil {
 		log.Warnf("config file reload err: %s", err.Error())
 		return
 	}
 
 	// etcd key 选项需要重启
-	cf.Node, cf.Proc, cf.Cmd, cf.Once, cf.Lock, cf.Group, cf.Noticer = c.Node, c.Proc, c.Cmd, c.Once, c.Lock, c.Group, c.Noticer
+	cf.Node, cf.Proc, cf.Cmd, cf.Once, cf.Csctl, cf.Lock, cf.Group, cf.Noticer = c.Node, c.Proc, c.Cmd, c.Once, c.Csctl, c.Lock, c.Group, c.Noticer
 
 	*c = *cf
-	log.Infof("config file[%s] reload success", *confFile)
+	log.Infof("config file[%s] reload success", confFile)
 	return
 }
 

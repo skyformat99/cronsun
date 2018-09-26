@@ -1,13 +1,17 @@
 package node
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"os"
+	"path"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	client "github.com/coreos/etcd/clientv3"
-
 	"github.com/shunfei/cronsun"
 	"github.com/shunfei/cronsun/conf"
 	"github.com/shunfei/cronsun/log"
@@ -35,16 +39,30 @@ type Node struct {
 }
 
 func NewNode(cfg *conf.Conf) (n *Node, err error) {
+	uuid, err := cfg.UUID()
+	if err != nil {
+		return
+	}
+
 	ip, err := utils.LocalIP()
 	if err != nil {
 		return
 	}
 
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = uuid
+		err = nil
+	}
+
 	n = &Node{
 		Client: cronsun.DefalutClient,
 		Node: &cronsun.Node{
-			ID:  ip.String(),
-			PID: strconv.Itoa(os.Getpid()),
+			ID:       uuid,
+			PID:      strconv.Itoa(os.Getpid()),
+			PIDFile:  strings.TrimSpace(cfg.PIDFile),
+			IP:       ip.String(),
+			Hostname: hostname,
 		},
 		Cron: cron.New(),
 
@@ -85,7 +103,44 @@ func (n *Node) set() error {
 	}
 
 	n.lID = resp.ID
+	n.writePIDFile()
+
 	return nil
+}
+
+func (n *Node) writePIDFile() {
+	if len(n.PIDFile) == 0 {
+		return
+	}
+
+	filename := "cronnode_pid"
+	if !strings.HasSuffix(n.PIDFile, "/") {
+		filename = path.Base(n.PIDFile)
+	}
+
+	dir := path.Dir(n.PIDFile)
+	err := os.MkdirAll(dir, 0755)
+	if err != nil {
+		log.Errorf("Failed to write pid file: %s. you can change PIDFile config in base.json", err)
+		return
+	}
+
+	n.PIDFile = path.Join(dir, filename)
+	err = ioutil.WriteFile(n.PIDFile, []byte(n.PID), 0644)
+	if err != nil {
+		log.Errorf("Failed to write pid file: %s. you can change PIDFile config in base.json", err)
+		return
+	}
+}
+
+func (n *Node) removePIDFile() {
+	if len(n.PIDFile) == 0 {
+		return
+	}
+
+	if err := os.Remove(n.PIDFile); err != nil {
+		log.Warnf("Failed to remove pid file: %s", err)
+	}
 }
 
 // 断网掉线重新注册
@@ -133,7 +188,7 @@ func (n *Node) loadJobs() (err error) {
 	}
 
 	for _, job := range jobs {
-		job.Init(n.ID)
+		job.Init(n.ID, n.Hostname, n.IP)
 		n.addJob(job, false)
 	}
 
@@ -142,6 +197,7 @@ func (n *Node) loadJobs() (err error) {
 
 func (n *Node) addJob(job *cronsun.Job, notice bool) {
 	n.link.addJob(job)
+
 	if job.IsRunOn(n.ID, n.groups) {
 		n.jobs[job.ID] = job
 	}
@@ -314,7 +370,14 @@ func (n *Node) groupAddNode(g *cronsun.Group) {
 				n.link.delGroupJob(g.ID, jid)
 				continue
 			}
-			job.Init(n.ID)
+
+			if err = job.Valid(); err != nil {
+				log.Warnf("invalid job[%s][%s]: %s", jl.gname, jid, err.Error())
+				n.link.delGroupJob(g.ID, jid)
+				continue
+			}
+
+			job.Init(n.ID, n.Hostname, n.IP)
 		}
 
 		cmds := job.Cmds(n.ID, n.groups)
@@ -358,33 +421,70 @@ func (n *Node) groupRmNode(g, og *cronsun.Group) {
 	n.groups[g.ID] = g
 }
 
+func (n *Node) KillExcutingProc(process *cronsun.Process) {
+	pid, _ := strconv.Atoi(process.ID)
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		log.Warnf("process:[%d] force kill failed, error:[%s]\n", pid, err)
+		return
+	}
+}
+
 func (n *Node) watchJobs() {
 	rch := cronsun.WatchJobs()
 	for wresp := range rch {
 		for _, ev := range wresp.Events {
 			switch {
 			case ev.IsCreate():
-				job, err := cronsun.GetJobFromKv(ev.Kv)
+				job, err := cronsun.GetJobFromKv(ev.Kv.Key, ev.Kv.Value)
 				if err != nil {
 					log.Warnf("err: %s, kv: %s", err.Error(), ev.Kv.String())
 					continue
 				}
 
-				job.Init(n.ID)
+				job.Init(n.ID, n.Hostname, n.IP)
 				n.addJob(job, true)
 			case ev.IsModify():
-				job, err := cronsun.GetJobFromKv(ev.Kv)
+				job, err := cronsun.GetJobFromKv(ev.Kv.Key, ev.Kv.Value)
 				if err != nil {
 					log.Warnf("err: %s, kv: %s", err.Error(), ev.Kv.String())
 					continue
 				}
 
-				job.Init(n.ID)
+				job.Init(n.ID, n.Hostname, n.IP)
 				n.modJob(job)
 			case ev.Type == client.EventTypeDelete:
 				n.delJob(cronsun.GetIDFromKey(string(ev.Kv.Key)))
 			default:
 				log.Warnf("unknown event type[%v] from job[%s]", ev.Type, string(ev.Kv.Key))
+			}
+		}
+	}
+}
+
+func (n *Node) watchExcutingProc() {
+	rch := cronsun.WatchProcs(n.ID)
+
+	for wresp := range rch {
+		for _, ev := range wresp.Events {
+			switch {
+			case ev.IsModify():
+				key := string(ev.Kv.Key)
+				process, err := cronsun.GetProcFromKey(key)
+				if err != nil {
+					log.Warnf("err: %s, kv: %s", err.Error(), ev.Kv.String())
+					continue
+				}
+
+				val := string(ev.Kv.Value)
+				pv := &cronsun.ProcessVal{}
+				err = json.Unmarshal([]byte(val), pv)
+				if err != nil {
+					continue
+				}
+				process.ProcessVal = *pv
+				if process.Killed {
+					n.KillExcutingProc(process)
+				}
 			}
 		}
 	}
@@ -396,7 +496,7 @@ func (n *Node) watchGroups() {
 		for _, ev := range wresp.Events {
 			switch {
 			case ev.IsCreate():
-				g, err := cronsun.GetGroupFromKv(ev.Kv)
+				g, err := cronsun.GetGroupFromKv(ev.Kv.Key, ev.Kv.Value)
 				if err != nil {
 					log.Warnf("err: %s, kv: %s", err.Error(), ev.Kv.String())
 					continue
@@ -404,7 +504,7 @@ func (n *Node) watchGroups() {
 
 				n.addGroup(g)
 			case ev.IsModify():
-				g, err := cronsun.GetGroupFromKv(ev.Kv)
+				g, err := cronsun.GetGroupFromKv(ev.Kv.Key, ev.Kv.Value)
 				if err != nil {
 					log.Warnf("err: %s, kv: %s", err.Error(), ev.Kv.String())
 					continue
@@ -441,6 +541,18 @@ func (n *Node) watchOnce() {
 	}
 }
 
+func (n *Node) watchCsctl() {
+	rch := cronsun.WatchCsctl()
+	for wresp := range rch {
+		for _, ev := range wresp.Events {
+			switch {
+			case ev.IsCreate(), ev.IsModify():
+				n.executCsctlCmd(ev.Kv.Key, ev.Kv.Value)
+			}
+		}
+	}
+}
+
 // 启动服务
 func (n *Node) Run() (err error) {
 	go n.keepAlive()
@@ -457,8 +569,10 @@ func (n *Node) Run() (err error) {
 
 	n.Cron.Start()
 	go n.watchJobs()
+	go n.watchExcutingProc()
 	go n.watchGroups()
 	go n.watchOnce()
+	go n.watchCsctl()
 	n.Node.On()
 	return
 }
@@ -470,4 +584,5 @@ func (n *Node) Stop(i interface{}) {
 	n.Node.Del()
 	n.Client.Close()
 	n.Cron.Stop()
+	n.removePIDFile()
 }

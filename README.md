@@ -12,7 +12,7 @@ The goal of this project is to make it much easier to manage jobs on lots of mac
 ## Features
 
 - Easy manage jobs on multiple machines
-- Managemant panel
+- Management panel
 - Mail service
 - Multi-language support
 - Simple authentication and accounts manager(default administrator email and password: admin@admin.com/admin)
@@ -53,7 +53,7 @@ We encourage you to try it, it's easy to use, see how it works for you. We belie
     "users": [
         "www", "db"
     ],
-    "#ext": "allowed execution file extension",
+    "#ext": "allowed execution file extensions",
     "ext": [
         ".cron.sh", ".cron.py"
     ]
@@ -66,11 +66,14 @@ We encourage you to try it, it's easy to use, see how it works for you. We belie
 
 Install from binary [latest release](https://github.com/shunfei/cronsun/releases/latest)
 
-Or build from source, require `go >= 1.9+`
+Or build from source, require `go >= 1.11+`.
+> NOTE: The branch `master` is not in stable, using Cronsun for production please checkout corresponding tags.
 
 ```
+export GO111MODULE=on
 go get -u github.com/shunfei/cronsun
 cd $GOPATH/src/github.com/shunfei/cronsun
+go mod vendor
 sh build.sh
 ```
 
@@ -78,9 +81,10 @@ sh build.sh
 
 1. Install [MongoDB](http://docs.mongodb.org/manual/installation/)
 2. Install [etcd3](https://github.com/coreos/etcd)
-3. Modify config in `conf` dir
-4. Start Node: `./cronnode -conf conf/base.json`, start Web: `./cronweb -conf conf/base.json`
-5. Opne `http://127.0.0.1:7079/ui/` with the browser
+3. Open and update Etcd(`conf/etcd.json`) and MongoDB(`conf/db.json`) configurations
+4. Start cronnode: `./cronnode -conf conf/base.json`, start cronweb: `./cronweb -conf conf/base.json`
+5. Open `http://127.0.0.1:7079` in browser
+6. Login with username `admin@admin.com` and password `admin`
 
 ## Screenshot
 

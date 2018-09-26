@@ -23,8 +23,11 @@ const (
 // 执行 cron cmd 的进程
 // 注册到 /cronsun/node/<id>
 type Node struct {
-	ID  string `bson:"_id" json:"id"`  // ip
-	PID string `bson:"pid" json:"pid"` // 进程 pid
+	ID       string `bson:"_id" json:"id"`  // machine id
+	PID      string `bson:"pid" json:"pid"` // 进程 pid
+	PIDFile  string `bson:"-" json:"-"`
+	IP       string `bson:"ip" json:"ip"` // node ip
+	Hostname string `bson:"hostname" json:"hostname"`
 
 	Version  string    `bson:"version" json:"version"`
 	UpTime   time.Time `bson:"up" json:"up"`     // 启动时间
@@ -90,11 +93,15 @@ func GetNodesBy(query interface{}) (nodes []*Node, err error) {
 	return
 }
 
+func GetNodesByID(id string) (node *Node, err error) {
+	err = mgoDB.FindId(Coll_Node, id, &node)
+	return
+}
+
 func RemoveNode(query interface{}) error {
 	return mgoDB.WithC(Coll_Node, func(c *mgo.Collection) error {
 		return c.Remove(query)
 	})
-
 }
 
 func ISNodeAlive(id string) (bool, error) {
@@ -135,15 +142,23 @@ func WatchNode() client.WatchChan {
 // On 结点实例启动后，在 mongoDB 中记录存活信息
 func (n *Node) On() {
 	n.Alived, n.Version, n.UpTime = true, Version, time.Now()
-	if err := mgoDB.Upsert(Coll_Node, bson.M{"_id": n.ID}, n); err != nil {
-		log.Errorf(err.Error())
-	}
+	n.SyncToMgo()
 }
 
 // On 结点实例停用后，在 mongoDB 中去掉存活信息
 func (n *Node) Down() {
 	n.Alived, n.DownTime = false, time.Now()
+	n.SyncToMgo()
+}
+
+func (n *Node) SyncToMgo() {
 	if err := mgoDB.Upsert(Coll_Node, bson.M{"_id": n.ID}, n); err != nil {
 		log.Errorf(err.Error())
 	}
+}
+
+// RmOldInfo remove old version(< 0.3.0) node info
+func (n *Node) RmOldInfo() {
+	RemoveNode(bson.M{"_id": n.IP})
+	DefalutClient.Delete(conf.Config.Node + n.IP)
 }
